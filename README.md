@@ -16,37 +16,37 @@ python scan.py config.json
 
 # Scan a GitHub repository
 python scan.py https://github.com/user/repo
-python scan.py user/repo -b develop     # specific branch
+python scan.py user/repo -b develop      # specific branch
 
-# Exclude paths
-python scan.py . -e vendor -e dist
-
-# JSON output
-python scan.py . --json
-
-# Skip high-entropy detection (pattern matching only)
-python scan.py . --no-entropy
+# Scan with options
+python scan.py . -e vendor -e dist        # exclude paths
+python scan.py . --json                   # JSON output
+python scan.py . --no-entropy             # skip high-entropy detection
 ```
 
 ## GitHub Search
 
-Search GitHub for repos containing potential API keys:
+Search GitHub for repos containing potential API keys.
 
 ```bash
-# Search with all default patterns
+# Quick search (all 11 default patterns)
 python scan.py --search -t ghp_xxxxxxxxxxxx
 
-# Custom search query
-python scan.py --search "AKIA" --limit 50 -t ghp_xxxxxxxxxxxx
+# Custom query
+python scan.py --search "AKIA" -t ghp_xxxxxxxxxxxx
 
-# Filter by language
-python scan.py --search -l python -l javascript -t ghp_xxxxxxxxxxxx
+# Tune search behavior
+python scan.py --search -t ghp_xxxxxxxxxxxx \
+    -l python -l javascript \              # language filter
+    --limit 50 \                           # results per query
+    --delay 6 \                            # delay between queries (seconds)
+    --max-retries 5                        # retry on rate limit
 
-# Search and deep-scan found repos
+# Search then clone + deep-scan each repo
 python scan.py --search --scan-results -t ghp_xxxxxxxxxxxx
 ```
 
-GitHub search requires a personal access token passed via `-t` / `--token`.
+GitHub search requires a personal access token via `-t` / `--token`. Rate-limited queries are automatically retried with exponential backoff (configurable via `--max-retries`).
 
 ## Supported Key Types
 
