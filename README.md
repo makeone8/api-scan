@@ -34,19 +34,19 @@ Search GitHub for repos containing potential API keys:
 
 ```bash
 # Search with all default patterns
-python scan.py --search
+python scan.py --search -t ghp_xxxxxxxxxxxx
 
 # Custom search query
-python scan.py --search "AKIA" --limit 50
+python scan.py --search "AKIA" --limit 50 -t ghp_xxxxxxxxxxxx
 
 # Filter by language
-python scan.py --search -l python -l javascript
+python scan.py --search -l python -l javascript -t ghp_xxxxxxxxxxxx
 
 # Search and deep-scan found repos
-python scan.py --search --scan-results
+python scan.py --search --scan-results -t ghp_xxxxxxxxxxxx
 ```
 
-GitHub search requires authentication — set `GITHUB_TOKEN` env var or install `gh` CLI.
+GitHub search requires a personal access token passed via `-t` / `--token`.
 
 ## Supported Key Types
 

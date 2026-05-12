@@ -274,69 +274,19 @@ def github_api_search(query: str, limit: int = 30, languages: list[str] | None =
     return hits
 
 
-def get_github_token() -> str | None:
-    """Get GitHub token from environment or git config."""
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if token:
-        return token
-    # Try git config credential helper
-    try:
-        result = subprocess.run(
-            ["git", "config", "--get", "github.token"],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
-
-
-def gh_cli_search(query: str, limit: int = 30) -> list[SearchHit]:
-    """Fallback: search via `gh search code` CLI."""
-    cmd = [
-        "gh", "search", "code", query,
-        "--limit", str(limit),
-        "--json", "repository,path",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return []
-    try:
-        entries = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-    hits = []
-    for entry in entries:
-        repo = entry.get("repository", {}).get("full_name", "unknown")
-        path = entry.get("path", "")
-        hits.append(SearchHit(repo, path, query))
-    return hits
-
-
 def run_github_search(queries: list[str] | None, limit: int,
-                      lang: list[str] | None, token: str | None) -> dict[str, list[SearchHit]]:
-    """Run search queries and return hits grouped by repo.
-    Uses REST API if token is available, otherwise falls back to gh CLI."""
+                      lang: list[str] | None, token: str) -> dict[str, list[SearchHit]]:
+    """Run search queries via GitHub REST API and return hits grouped by repo."""
     if queries is None:
         items = [(name, q) for name, q in SEARCH_QUERIES]
     else:
         items = [(q, q) for q in queries]
 
-    use_api = bool(token)
-    if use_api:
-        print(f"Using GitHub API (authenticated)\n")
-    else:
-        print(f"Using gh CLI\n")
-
     all_hits: dict[str, list[SearchHit]] = defaultdict(list)
 
     for name, query in items:
         print(f"Searching: [{name}] \"{query}\" ...", end=" ", flush=True)
-        if use_api:
-            hits = github_api_search(query, limit=limit, languages=lang, token=token)
-        else:
-            hits = gh_cli_search(query, limit=limit)
+        hits = github_api_search(query, limit=limit, languages=lang, token=token)
         print(f"{len(hits)} result(s)")
         for h in hits:
             all_hits[h.repo].append(h)
@@ -440,6 +390,10 @@ def main():
         help="Search GitHub for repos containing potential API keys"
     )
     parser.add_argument(
+        "--token", "-t", default=None,
+        help="GitHub personal access token (required for --search)"
+    )
+    parser.add_argument(
         "--scan-results", action="store_true",
         help="Clone and deep-scan repos found by --search"
     )
@@ -481,26 +435,15 @@ def main():
 
     # ── Search mode ──
     if args.search:
-        # if path is provided and not default, use it as a custom query
+        if not args.token:
+            print("[!] --search requires --token <github_token>", file=sys.stderr)
+            sys.exit(1)
+
         custom_queries = None
         if args.path != ".":
             custom_queries = [args.path]
 
-        token = get_github_token()
-        gh_ok = False
-        if not token:
-            gh_path = shutil.which("gh")
-            if gh_path:
-                result = subprocess.run([gh_path, "auth", "status"], capture_output=True, text=True)
-                gh_ok = result.returncode == 0
-            if not gh_ok:
-                print("[!] GitHub code search requires authentication.")
-                print("    Options:")
-                print("      1. Set GITHUB_TOKEN env var")
-                print("      2. Install and login with gh CLI: gh auth login")
-                sys.exit(1)
-
-        hits_by_repo = run_github_search(custom_queries, args.limit, args.language, token)
+        hits_by_repo = run_github_search(custom_queries, args.limit, args.language, args.token)
         if args.json:
             output = [
                 {
