@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -235,36 +236,57 @@ def format_findings(findings: list[Finding], root: str) -> str:
 
 # ── GitHub search ────────────────────────────────────────────────────
 
+# Repos that collect or document key patterns (not actual leaks)
+FALSE_POSITIVE_REPOS = {
+    "zapstiko/Bug-Bounty",
+    "ZephrFish/BugBountyTemplates",
+    "ca0s/gitgrep",
+    "RoseSecurity/Red-Teaming-TTPs",
+    "ghsec/webHunt",
+    "girliemac/slack-httpstatuscats",
+    "HariSekhon/Knowledge-Base",
+    "adambard/learnxinyminutes-docs",
+}
+
+
 def github_api_search(query: str, limit: int = 30, languages: list[str] | None = None,
-                       token: str | None = None) -> list[SearchHit]:
-    """Search GitHub code via the REST API."""
+                      token: str | None = None, max_retries: int = 3) -> list[SearchHit]:
+    """Search GitHub code via the REST API, with retry on rate limit."""
     q = query
     if languages:
         lang_filter = " ".join(f"language:{l}" for l in languages)
         q = f"{query} {lang_filter}"
 
     url = f"https://api.github.com/search/code?q={urllib.parse.quote(q)}&per_page={min(limit, 100)}"
-    req = urllib.request.Request(url)
-    req.add_header("Accept", "application/vnd.github.v3+json")
-    req.add_header("User-Agent", "api-key-scanner")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code == 403 or e.code == 429:
-            print(f"[!] GitHub API rate limit hit. Set GITHUB_TOKEN env var for higher limits.", file=sys.stderr)
-        elif e.code == 422:
-            # Unprocessable — query too broad or invalid
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url)
+        req.add_header("Accept", "application/vnd.github.v3+json")
+        req.add_header("User-Agent", "api-key-scanner")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode())
+            break  # success, exit retry loop
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                if attempt < max_retries:
+                    wait = (2 ** attempt) * 5  # 5, 10, 20 seconds
+                    print(f"\n    Rate limited, retrying in {wait}s (attempt {attempt + 1}/{max_retries})...",
+                          end=" ", flush=True, file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                print(f"\n    Rate limit exhausted after {max_retries} retries.", file=sys.stderr)
+            elif e.code == 422:
+                return []
+            else:
+                print(f"\n    API error {e.code}", file=sys.stderr)
             return []
-        else:
-            print(f"[!] GitHub API error {e.code} for query '{query}'", file=sys.stderr)
-        return []
-    except Exception as e:
-        print(f"[!] Search failed for '{query}': {e}", file=sys.stderr)
-        return []
+        except Exception as e:
+            print(f"\n    Search failed: {e}", file=sys.stderr)
+            return []
 
     hits = []
     for item in body.get("items", [])[:limit]:
@@ -275,7 +297,8 @@ def github_api_search(query: str, limit: int = 30, languages: list[str] | None =
 
 
 def run_github_search(queries: list[str] | None, limit: int,
-                      lang: list[str] | None, token: str) -> dict[str, list[SearchHit]]:
+                      lang: list[str] | None, token: str,
+                      delay: float = 0, max_retries: int = 3) -> dict[str, list[SearchHit]]:
     """Run search queries via GitHub REST API and return hits grouped by repo."""
     if queries is None:
         items = [(name, q) for name, q in SEARCH_QUERIES]
@@ -283,13 +306,36 @@ def run_github_search(queries: list[str] | None, limit: int,
         items = [(q, q) for q in queries]
 
     all_hits: dict[str, list[SearchHit]] = defaultdict(list)
+    total_results = 0
+    failed = 0
 
-    for name, query in items:
-        print(f"Searching: [{name}] \"{query}\" ...", end=" ", flush=True)
-        hits = github_api_search(query, limit=limit, languages=lang, token=token)
-        print(f"{len(hits)} result(s)")
+    for i, (name, query) in enumerate(items, 1):
+        print(f"[{i}/{len(items)}] {name}: \"{query}\" ...", end=" ", flush=True)
+        start = time.time()
+        hits = github_api_search(query, limit=limit, languages=lang,
+                                  token=token, max_retries=max_retries)
+        elapsed = time.time() - start
+        if hits:
+            count = len(hits)
+            total_results += count
+            real = [h for h in hits if h.repo not in FALSE_POSITIVE_REPOS]
+            flagged = count - len(real)
+            flag = f"  ({flagged} from known regex collections)" if flagged else ""
+            print(f"{count} result(s) in {elapsed:.1f}s{flag}")
+        else:
+            failed += 1
+            print(f"0 results in {elapsed:.1f}s")
         for h in hits:
             all_hits[h.repo].append(h)
+        if delay > 0 and i < len(items):
+            time.sleep(delay)
+
+    if failed:
+        print(f"\n{failed}/{len(items)} queries returned no results.")
+    if total_results:
+        false_pos = sum(1 for repo in all_hits if repo in FALSE_POSITIVE_REPOS)
+        if false_pos:
+            print(f"{false_pos} repo(s) are known regex collections (flagged).")
 
     return all_hits
 
@@ -299,10 +345,14 @@ def format_search_results(hits_by_repo: dict[str, list[SearchHit]]) -> str:
         return "\n[OK] No results.\n"
 
     total = sum(len(v) for v in hits_by_repo.values())
-    lines = [f"\n[!] {total} hit(s) across {len(hits_by_repo)} repo(s):\n"]
+    real_repos = [r for r in hits_by_repo if r not in FALSE_POSITIVE_REPOS]
+    lines = [f"\n[!] {total} hit(s) across {len(hits_by_repo)} repo(s)",
+             f"    ({len(real_repos)} likely real, {len(hits_by_repo) - len(real_repos)} known regex collections)\n"]
 
-    for repo, hits in sorted(hits_by_repo.items(), key=lambda x: -len(x[1])):
-        lines.append(f"  github.com/{repo}  ({len(hits)} hits)")
+    # Show likely-real repos first
+    for repo, hits in sorted(hits_by_repo.items(), key=lambda x: (-len(x[1]), x[0])):
+        tag = " [REGEX COLLECTION]" if repo in FALSE_POSITIVE_REPOS else ""
+        lines.append(f"  github.com/{repo}  ({len(hits)} hits){tag}")
         shown = set()
         for h in hits:
             key = (h.path, h.name)
@@ -394,6 +444,14 @@ def main():
         help="GitHub personal access token (required for --search)"
     )
     parser.add_argument(
+        "--delay", "-d", type=float, default=2.0,
+        help="Delay in seconds between search queries (default: 2.0)"
+    )
+    parser.add_argument(
+        "--max-retries", type=int, default=3,
+        help="Max retries on rate limit (default: 3, with exponential backoff)"
+    )
+    parser.add_argument(
         "--scan-results", action="store_true",
         help="Clone and deep-scan repos found by --search"
     )
@@ -443,7 +501,9 @@ def main():
         if args.path != ".":
             custom_queries = [args.path]
 
-        hits_by_repo = run_github_search(custom_queries, args.limit, args.language, args.token)
+        hits_by_repo = run_github_search(custom_queries, args.limit, args.language,
+                                            args.token, delay=args.delay,
+                                            max_retries=args.max_retries)
         if args.json:
             output = [
                 {
