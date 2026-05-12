@@ -10,6 +10,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import urllib.request
+import urllib.error
 from collections import defaultdict
 from pathlib import Path
 
@@ -184,8 +187,9 @@ def is_likely_false_positive(token: str) -> bool:
 
 def scan_directory(root: str, patterns: list, scan_entropy: bool, exclude: set[str]) -> list[Finding]:
     findings = []
+    exclude_toplevel = {e.lstrip("/\\").split(os.sep)[0] for e in exclude}
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d) and d not in exclude_toplevel]
         rel_dir = os.path.relpath(dirpath, root)
         if rel_dir == ".":
             rel_dir = ""
@@ -238,9 +242,6 @@ def github_api_search(query: str, limit: int = 30, languages: list[str] | None =
     if languages:
         lang_filter = " ".join(f"language:{l}" for l in languages)
         q = f"{query} {lang_filter}"
-
-    import urllib.request
-    import urllib.error
 
     url = f"https://api.github.com/search/code?q={urllib.parse.quote(q)}&per_page={min(limit, 100)}"
     req = urllib.request.Request(url)
@@ -307,7 +308,7 @@ def gh_cli_search(query: str, limit: int = 30) -> list[SearchHit]:
         return []
     hits = []
     for entry in entries:
-        repo = entry.get("repository", {}).get("fullName", "unknown")
+        repo = entry.get("repository", {}).get("full_name", "unknown")
         path = entry.get("path", "")
         hits.append(SearchHit(repo, path, query))
     return hits
@@ -401,15 +402,18 @@ def scan_and_report(target: str, patterns: list, args, label: str = "") -> int:
         return -1
 
     if args.json:
-        output = [
-            {
-                "file": os.path.relpath(f.filepath, target),
+        output = []
+        for f in findings:
+            try:
+                file_rel = os.path.relpath(f.filepath, target)
+            except ValueError:
+                file_rel = f.filepath
+            output.append({
+                "file": file_rel,
                 "line": f.line,
                 "type": f.name,
                 "match": f.match,
-            }
-            for f in findings
-        ]
+            })
         print(json.dumps(output, indent=2, ensure_ascii=False))
     else:
         if label:
@@ -483,21 +487,34 @@ def main():
             custom_queries = [args.path]
 
         token = get_github_token()
-        if not token and not shutil.which("gh"):
-            print("[!] GitHub code search requires authentication.")
-            print("    Options:")
-            print("      1. Set GITHUB_TOKEN env var")
-            print("      2. Install and login with gh CLI: gh auth login")
-            sys.exit(1)
+        gh_ok = False
+        if not token:
+            gh_path = shutil.which("gh")
+            if gh_path:
+                result = subprocess.run([gh_path, "auth", "status"], capture_output=True, text=True)
+                gh_ok = result.returncode == 0
+            if not gh_ok:
+                print("[!] GitHub code search requires authentication.")
+                print("    Options:")
+                print("      1. Set GITHUB_TOKEN env var")
+                print("      2. Install and login with gh CLI: gh auth login")
+                sys.exit(1)
 
-        try:
-            hits_by_repo = run_github_search(custom_queries, args.limit, args.language, token)
-        except SystemExit:
-            raise
-        except Exception as e:
-            print(f"[!] Search error: {e}", file=sys.stderr)
-            sys.exit(1)
-        print(format_search_results(hits_by_repo))
+        hits_by_repo = run_github_search(custom_queries, args.limit, args.language, token)
+        if args.json:
+            output = [
+                {
+                    "repo": repo,
+                    "hits": [
+                        {"path": h.path, "type": h.name}
+                        for h in hits
+                    ],
+                }
+                for repo, hits in sorted(hits_by_repo.items())
+            ]
+            print(json.dumps(output, indent=2, ensure_ascii=False))
+        else:
+            print(format_search_results(hits_by_repo))
 
         if args.scan_results and hits_by_repo:
             print("\n── Scanning found repos ──")
@@ -541,7 +558,7 @@ def main():
         else:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
-    sys.exit(1 if (count is not None and count > 0) else 0)
+    sys.exit(0 if count == 0 else 1)
 
 
 if __name__ == "__main__":
