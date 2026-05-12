@@ -1,0 +1,3 @@
+# API Key Scanner
+# No external dependencies required — uses Python stdlib only.
+# Minimum Python version: 3.10
